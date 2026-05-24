@@ -15,7 +15,8 @@ EXPANSION_SYSTEM_PROMPT = """你是一名医学信息学专家、临床术语规
 6. 请同时考虑中文名称、常见简称、英文缩写、英文全称、ICD编码前缀和常见临床表述。
 7. 如果用户输入的是宽泛疾病类别，请给出下位疾病和相关疾病，但要标记为 related_keywords。
 8. 如果用户输入的是具体疾病，请优先生成同义词、缩写、常见变体和ICD关键词。
-9. 返回JSON必须可被Python json.loads 直接解析。"""
+9. 返回JSON必须可被Python json.loads 直接解析。
+10. 请遵循“精准词优先、模糊词补充”的流程：include_keywords=精准词；possible/related=模糊词。"""
 
 EXPANSION_USER_TEMPLATE = """目标疾病：
 {target_disease}
@@ -39,7 +40,7 @@ EXPANSION_USER_TEMPLATE = """目标疾病：
   "english_terms": ["英文全称或英文常用表达"],
   "icd_keywords": ["可能相关的ICD编码前缀或ICD名称关键词"],
   "include_keywords": ["建议用于强召回的纳入关键词"],
-  "possible_keywords": ["可能相关、但需要进一步判断的关键词"],
+  "possible_keywords": ["模糊召回关键词（需要AI二次判断）"],
   "related_keywords": ["相关但不一定等同于目标疾病的关键词"],
   "exclude_keywords": ["明显需要排除或警惕的关键词"],
   "negation_keywords": ["否定表述关键词，例如未见、否认、排除"],
@@ -54,8 +55,8 @@ EXPANSION_USER_TEMPLATE = """目标疾病：
 1. 所有字段都必须存在。
 2. 如果没有内容，使用空数组。
 3. 不要输出JSON以外的任何内容。
-4. include_keywords要尽量精确。
-5. related_keywords可以更宽，但不能替代include_keywords。
+4. include_keywords要尽量精确，作为规则强匹配词。
+5. possible_keywords和related_keywords用于模糊召回，后续需AI分层和用户终审。
 6. ICD编码只放入icd_keywords，不要混在疾病名称里。
 7. 如果不确定ICD编码，不要强行给出精确编码，可给出疾病名称关键词。"""
 

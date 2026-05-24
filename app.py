@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import os
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -18,22 +18,18 @@ st.set_page_config(page_title="WHALE/HDR疾病case筛选任务生成工具", lay
 st.title("WHALE/HDR 疾病case筛选任务生成工具 MVP")
 st.caption("仅处理脱敏疾病名称、ICD编码、来源类型、诊断类型和统计人数；生成的SQL/R代码供管理员审核执行。")
 
-if "expansion" not in st.session_state:
-    st.session_state.expansion = None
-if "disease_candidates" not in st.session_state:
-    st.session_state.disease_candidates = pd.DataFrame()
-if "icd_candidates" not in st.session_state:
-    st.session_state.icd_candidates = pd.DataFrame()
-if "disease_classified" not in st.session_state:
-    st.session_state.disease_classified = pd.DataFrame()
-if "icd_classified" not in st.session_state:
-    st.session_state.icd_classified = pd.DataFrame()
-if "warnings" not in st.session_state:
-    st.session_state.warnings = []
-if "api_success" not in st.session_state:
-    st.session_state.api_success = False
-if "json_repaired" not in st.session_state:
-    st.session_state.json_repaired = False
+for k, v in {
+    "expansion": None,
+    "disease_candidates": pd.DataFrame(),
+    "icd_candidates": pd.DataFrame(),
+    "disease_classified": pd.DataFrame(),
+    "icd_classified": pd.DataFrame(),
+    "warnings": [],
+    "api_success": False,
+    "json_repaired": False,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 with st.sidebar:
     st.header("运行状态")
@@ -44,19 +40,46 @@ with st.sidebar:
     use_api = st.checkbox("调用DeepSeek API", value=bool(os.environ.get("DEEPSEEK_API_KEY")))
     st.info("请勿上传患者ID、姓名、身份证、visitid、完整病历原文等患者级敏感信息。")
 
-st.header("1. 数据上传区")
+st.header("0. 使用说明")
+with st.expander("我需要做什么？会得到什么？", expanded=True):
+    st.markdown(
+        """
+- **你需要做的事**：
+  1) 确认本地两份脱敏清单路径（疾病名称清单、ICD清单）；
+  2) 输入目标疾病与补充口径；
+  3) 审核 AI 给出的**精准词**与**模糊词**；
+  4) 复核候选分层并确认最终纳入结果。
+- **系统会帮你做的事**：
+  1) 从数十万级疾病记录中按规则快速召回；
+  2) 对模糊召回候选做 AI 语义判断与标注；
+  3) 生成管理员可复核执行的任务包（CSV + SQL + R）。
+- **你将获得**：
+  - 最终纳入疾病名称/ICD清单；
+  - 全流程可追溯的分层和筛选依据；
+  - 可提交给管理员的标准 ZIP 任务包。
+        """
+    )
+
+st.header("1. 读取本地数据")
 col1, col2 = st.columns(2)
 with col1:
-    disease_file = st.file_uploader("上传 disease_terms.csv", type=["csv"], key="disease_file")
+    disease_path = st.text_input("本地 disease_terms.csv 路径", value="data/disease_terms.csv")
 with col2:
-    icd_file = st.file_uploader("上传 icd_terms.csv", type=["csv"], key="icd_file")
+    icd_path = st.text_input("本地 icd_terms.csv 路径", value="data/icd_terms.csv")
 
 @st.cache_data(show_spinner=False)
-def _read_uploaded(file):
-    return safe_read_csv(file)
+def _read_local(path_text: str) -> pd.DataFrame:
+    path = Path(path_text).expanduser()
+    if not path.exists() or not path.is_file():
+        return pd.DataFrame()
+    return safe_read_csv(path)
 
-disease_df = _read_uploaded(disease_file) if disease_file else pd.DataFrame()
-icd_df = _read_uploaded(icd_file) if icd_file else pd.DataFrame()
+disease_df = _read_local(disease_path)
+icd_df = _read_local(icd_path)
+if disease_df.empty:
+    st.warning(f"未读取到疾病名称清单：{disease_path}")
+if icd_df.empty:
+    st.warning(f"未读取到ICD清单：{icd_path}")
 
 st.subheader("2. 诊断类型配置区")
 mapping_file = st.file_uploader("上传已有 diagnosis_type_mapping.yaml（可选）", type=["yaml", "yml"])
@@ -69,32 +92,14 @@ for frame in [disease_df, icd_df]:
 raw_diag_values = unique_nonempty(combined_diag)
 base_mapping = {raw: loaded_mapping.get(raw) or apply_diagnosis_type_mapping(pd.DataFrame({"diagnosis_type": [raw]})).loc[0, "diagnosis_type_norm"] for raw in raw_diag_values}
 map_df = pd.DataFrame([{"diagnosis_type": k, "diagnosis_type_norm": v} for k, v in base_mapping.items()])
-if not map_df.empty:
-    edited_map_df = st.data_editor(map_df, num_rows="dynamic", use_container_width=True, key="mapping_editor")
-else:
-    edited_map_df = map_df
+edited_map_df = st.data_editor(map_df, num_rows="dynamic", use_container_width=True, key="mapping_editor") if not map_df.empty else map_df
 mapping = dict(zip(edited_map_df.get("diagnosis_type", []), edited_map_df.get("diagnosis_type_norm", []))) if not edited_map_df.empty else {}
 st.download_button("导出 diagnosis_type_mapping.yaml", export_mapping_yaml(mapping), file_name="diagnosis_type_mapping.yaml")
 
 disease_df = apply_diagnosis_type_mapping(disease_df, mapping) if not disease_df.empty else disease_df
 icd_df = apply_diagnosis_type_mapping(icd_df, mapping) if not icd_df.empty else icd_df
 
-c1, c2 = st.columns(2)
-c1.metric("疾病名称总数", len(disease_df))
-c2.metric("ICD编码总数", len(icd_df))
-with st.expander("数据分布", expanded=False):
-    a, b, c = st.columns(3)
-    with a:
-        st.write("source_type分布")
-        st.dataframe(pd.concat([count_distribution(disease_df, "source_type"), count_distribution(icd_df, "source_type")]).groupby("source_type", as_index=False)["count"].sum() if (not disease_df.empty or not icd_df.empty) else pd.DataFrame())
-    with b:
-        st.write("diagnosis_type分布")
-        st.dataframe(pd.concat([count_distribution(disease_df, "diagnosis_type"), count_distribution(icd_df, "diagnosis_type")]).groupby("diagnosis_type", as_index=False)["count"].sum() if (not disease_df.empty or not icd_df.empty) else pd.DataFrame())
-    with c:
-        st.write("diagnosis_type_norm分布")
-        st.dataframe(pd.concat([count_distribution(disease_df, "diagnosis_type_norm"), count_distribution(icd_df, "diagnosis_type_norm")]).groupby("diagnosis_type_norm", as_index=False)["count"].sum() if (not disease_df.empty or not icd_df.empty) else pd.DataFrame())
-
-st.header("3. 用户输入区")
+st.header("3. 用户输入与口径")
 col1, col2 = st.columns(2)
 with col1:
     target_disease = st.text_input("目标疾病", placeholder="例如：慢性肾脏病")
@@ -107,19 +112,8 @@ all_diag_norm = unique_nonempty(list(disease_df.get("diagnosis_type_norm", [])) 
 default_diag_priority = build_default_priority(all_diag_norm)
 selected_sources = st.multiselect("选择纳入来源类型", all_source_types, default=all_source_types)
 selected_diag = st.multiselect("选择纳入诊断类型归并", all_diag_norm, default=all_diag_norm)
-opts = st.columns(4)
-include_history = opts[0].checkbox("纳入既往史", value=False)
-include_present_history = opts[1].checkbox("纳入现病史", value=True)
-include_suspected = opts[2].checkbox("纳入疑似诊断", value=False)
-include_related = opts[3].checkbox("纳入相关但不等同疾病", value=False)
 
-source_priority_text = st.text_area("来源类型优先级（每行一个，越靠前优先级越高）", value="\n".join(all_source_types), height=120)
-diag_priority_text = st.text_area("诊断类型优先级（每行一个，越靠前优先级越高）", value="\n".join(default_diag_priority), height=160)
-source_priority = [x.strip() for x in source_priority_text.splitlines() if x.strip()]
-diag_priority = [x.strip() for x in diag_priority_text.splitlines() if x.strip()]
-
-filtered_disease = disease_df.copy()
-filtered_icd = icd_df.copy()
+filtered_disease, filtered_icd = disease_df.copy(), icd_df.copy()
 if selected_sources:
     if "source_type" in filtered_disease.columns:
         filtered_disease = filtered_disease[filtered_disease["source_type"].isin(selected_sources)]
@@ -129,7 +123,7 @@ if selected_diag:
     filtered_disease = filtered_disease[filtered_disease["diagnosis_type_norm"].isin(selected_diag)] if not filtered_disease.empty else filtered_disease
     filtered_icd = filtered_icd[filtered_icd["diagnosis_type_norm"].isin(selected_diag)] if not filtered_icd.empty else filtered_icd
 
-st.header("4. 自动扩展区")
+st.header("4. AI词汇理解（精准词 / 模糊词）")
 if st.button("生成/刷新疾病表达扩展", disabled=not target_disease):
     raw, ok, msg = call_expansion(target_disease, user_notes, all_source_types, raw_diag_values) if use_api else ("", False, "已选择不调用API。")
     expansion, warnings = parse_expansion_response(raw, target_disease, call_json_repair)
@@ -137,120 +131,50 @@ if st.button("生成/刷新疾病表达扩展", disabled=not target_disease):
     st.session_state.warnings.extend(warnings + ([msg] if msg else []))
     st.session_state.api_success = st.session_state.api_success or ok
 
-expansion = st.session_state.expansion or {
-    "target_disease": target_disease,
-    "standard_name_guess": target_disease,
-    "synonyms_cn": [],
-    "abbreviations": [],
-    "english_terms": [],
-    "icd_keywords": [],
-    "include_keywords": [target_disease] if target_disease else [],
-    "possible_keywords": [],
-    "related_keywords": [],
-    "exclude_keywords": ["未见", "否认", "排除", "待排"],
-    "negation_keywords": ["未见", "否认", "排除", "无"],
-    "suspected_keywords": ["待排", "可能", "疑似", "？", "?"],
-    "history_keywords": [],
-    "source_priority_advice": [],
-    "caution_notes": [],
-}
+expansion = st.session_state.expansion or {"target_disease": target_disease, "standard_name_guess": target_disease, "synonyms_cn": [], "abbreviations": [], "english_terms": [], "icd_keywords": [], "include_keywords": [target_disease] if target_disease else [], "possible_keywords": [], "related_keywords": [], "exclude_keywords": ["未见", "否认", "排除", "待排"], "negation_keywords": ["未见", "否认", "排除", "无"], "suspected_keywords": ["待排", "可能", "疑似", "？", "?"], "history_keywords": [], "source_priority_advice": [], "caution_notes": []}
 
-editable_fields = ["synonyms_cn", "abbreviations", "english_terms", "icd_keywords", "include_keywords", "possible_keywords", "related_keywords", "exclude_keywords", "negation_keywords", "suspected_keywords", "history_keywords", "caution_notes"]
-cols = st.columns(2)
-for i, field in enumerate(editable_fields):
-    with cols[i % 2]:
-        text_value = st.text_area(field, value="\n".join(expansion.get(field, [])), height=100, key=f"exp_{field}")
-        expansion[field] = [x.strip() for x in text_value.splitlines() if x.strip()]
-expansion["target_disease"] = target_disease or expansion.get("target_disease", "")
-expansion["standard_name_guess"] = st.text_input("standard_name_guess", value=expansion.get("standard_name_guess", target_disease))
+st.subheader("4a. 精准词（规则强匹配）")
+include_keywords_text = st.text_area("include_keywords", value="\n".join(expansion.get("include_keywords", [])), height=120)
+expansion["include_keywords"] = [x.strip() for x in include_keywords_text.splitlines() if x.strip()]
+
+st.subheader("4b. 模糊词（扩展召回 + AI复核）")
+possible_keywords_text = st.text_area("possible_keywords", value="\n".join(expansion.get("possible_keywords", [])), height=100)
+related_keywords_text = st.text_area("related_keywords", value="\n".join(expansion.get("related_keywords", [])), height=100)
+expansion["possible_keywords"] = [x.strip() for x in possible_keywords_text.splitlines() if x.strip()]
+expansion["related_keywords"] = [x.strip() for x in related_keywords_text.splitlines() if x.strip()]
+
+other_fields = ["synonyms_cn", "abbreviations", "english_terms", "icd_keywords", "exclude_keywords", "negation_keywords", "suspected_keywords", "history_keywords", "caution_notes"]
+for field in other_fields:
+    text_value = st.text_area(field, value="\n".join(expansion.get(field, [])), height=90, key=f"exp_{field}")
+    expansion[field] = [x.strip() for x in text_value.splitlines() if x.strip()]
 st.session_state.expansion = expansion
 
-st.header("5. 候选召回区")
+st.header("5. 候选召回（精准优先 + 模糊补充）")
 if st.button("执行候选召回", disabled=not target_disease):
-    disease_candidates, disease_trunc = recall_disease_terms(filtered_disease, expansion, diag_priority)
-    icd_candidates, icd_trunc = recall_icd_terms(filtered_icd, expansion, diag_priority)
-    st.session_state.disease_candidates = disease_candidates
-    st.session_state.icd_candidates = icd_candidates
+    diag_priority = build_default_priority(selected_diag)
+    st.session_state.disease_candidates, disease_trunc = recall_disease_terms(filtered_disease, expansion, diag_priority)
+    st.session_state.icd_candidates, icd_trunc = recall_icd_terms(filtered_icd, expansion, diag_priority)
     st.session_state.truncation = {"disease": disease_trunc, "icd": icd_trunc}
 
-disease_candidates = st.session_state.disease_candidates
-icd_candidates = st.session_state.icd_candidates
-c1, c2 = st.columns(2)
-c1.metric("疾病名称候选", len(disease_candidates))
-c2.metric("ICD候选", len(icd_candidates))
-with st.expander("疾病名称候选", expanded=True):
-    st.dataframe(disease_candidates, use_container_width=True)
-with st.expander("ICD编码候选", expanded=True):
-    st.dataframe(icd_candidates, use_container_width=True)
+st.dataframe(st.session_state.disease_candidates, use_container_width=True)
+st.dataframe(st.session_state.icd_candidates, use_container_width=True)
 
-st.header("6. 模型分层区")
-if st.button("执行模型分层/规则兜底", disabled=disease_candidates.empty and icd_candidates.empty):
-    disease_classified, d_meta = classify_candidates(disease_candidates, "disease_name", target_disease, expansion, user_notes, use_api=use_api)
-    icd_classified, i_meta = classify_candidates(icd_candidates, "icd_code", target_disease, expansion, user_notes, use_api=use_api)
-    st.session_state.disease_classified = disease_classified
-    st.session_state.icd_classified = icd_classified
+st.header("6. AI分层与用户终审")
+if st.button("执行模型分层/规则兜底", disabled=st.session_state.disease_candidates.empty and st.session_state.icd_candidates.empty):
+    disease_classified, d_meta = classify_candidates(st.session_state.disease_candidates, "disease_name", target_disease, expansion, user_notes, use_api=use_api)
+    icd_classified, i_meta = classify_candidates(st.session_state.icd_candidates, "icd_code", target_disease, expansion, user_notes, use_api=use_api)
+    st.session_state.disease_classified, st.session_state.icd_classified = disease_classified, icd_classified
     st.session_state.warnings.extend(d_meta.get("warnings", []) + i_meta.get("warnings", []))
-    st.session_state.api_success = st.session_state.api_success or d_meta.get("api_success", False) or i_meta.get("api_success", False)
-    st.session_state.json_repaired = st.session_state.json_repaired or d_meta.get("json_repaired", False) or i_meta.get("json_repaired", False)
 
-disease_classified = st.session_state.disease_classified
-icd_classified = st.session_state.icd_classified
-with st.expander("疾病名称分层结果", expanded=True):
-    st.dataframe(disease_classified, use_container_width=True)
-with st.expander("ICD编码分层结果", expanded=True):
-    st.dataframe(icd_classified, use_container_width=True)
-
-st.header("7. 用户确认区")
 selection_mode = st.radio("筛选模式", ["严格模式", "宽松模式", "高召回模式", "自定义模式"], horizontal=True)
-custom_disease_ids = []
-custom_icd_ids = []
-if selection_mode == "自定义模式":
-    custom_disease_ids = st.multiselect("手动勾选疾病名称候选ID", disease_classified.get("candidate_id", pd.Series(dtype=str)).astype(str).tolist()) if not disease_classified.empty else []
-    custom_icd_ids = st.multiselect("手动勾选ICD候选ID", icd_classified.get("candidate_id", pd.Series(dtype=str)).astype(str).tolist()) if not icd_classified.empty else []
-
-selected_disease_df = apply_user_mode_selection(disease_classified, selection_mode, include_history, include_present_history, include_suspected, include_related, custom_disease_ids) if not disease_classified.empty else disease_classified
-selected_icd_df = apply_user_mode_selection(icd_classified, selection_mode, include_history, include_present_history, include_suspected, include_related, custom_icd_ids) if not icd_classified.empty else icd_classified
+selected_disease_df = apply_user_mode_selection(st.session_state.disease_classified, selection_mode, False, True, False, False, []) if not st.session_state.disease_classified.empty else st.session_state.disease_classified
+selected_icd_df = apply_user_mode_selection(st.session_state.icd_classified, selection_mode, False, True, False, False, []) if not st.session_state.icd_classified.empty else st.session_state.icd_classified
 final_disease = selected_disease_df[selected_disease_df["final_include"]].copy() if not selected_disease_df.empty else pd.DataFrame()
 final_icd = selected_icd_df[selected_icd_df["final_include"]].copy() if not selected_icd_df.empty else pd.DataFrame()
 st.write(f"最终纳入疾病名称：{len(final_disease)} 条；最终纳入ICD编码：{len(final_icd)} 条")
-st.dataframe(final_disease, use_container_width=True)
-st.dataframe(final_icd, use_container_width=True)
 
-st.header("8. 管理员任务包生成区")
-metadata = {
-    "task_name": task_name,
-    "target_disease": target_disease,
-    "user_notes": user_notes,
-    "created_at": timestamp_string(),
-    "disease_filename": getattr(disease_file, "name", ""),
-    "icd_filename": getattr(icd_file, "name", ""),
-    "disease_total": len(disease_df),
-    "icd_total": len(icd_df),
-    "selection_mode": selection_mode,
-    "include_history": include_history,
-    "include_present_history": include_present_history,
-    "include_suspected": include_suspected,
-    "include_related": include_related,
-    "selected_source_types": selected_sources,
-    "selected_diagnosis_types": selected_diag,
-    "source_priority": source_priority,
-    "diagnosis_priority": diag_priority,
-    "disease_candidate_count": len(disease_candidates),
-    "icd_candidate_count": len(icd_candidates),
-    "final_disease_count": len(final_disease),
-    "final_icd_count": len(final_icd),
-    "candidate_truncated": any(x.get("truncated") for x in getattr(st.session_state, "truncation", {}).values()) if hasattr(st.session_state, "truncation") else False,
-    "api_success": st.session_state.api_success,
-    "json_repaired": st.session_state.json_repaired,
-    "warnings": st.session_state.warnings,
-}
-classification_json = {
-    "disease_name": disease_classified.to_dict(orient="records") if not disease_classified.empty else [],
-    "icd_code": icd_classified.to_dict(orient="records") if not icd_classified.empty else [],
-}
+st.header("7. 管理员任务包生成")
+metadata = {"task_name": task_name, "target_disease": target_disease, "user_notes": user_notes, "created_at": timestamp_string(), "disease_filename": disease_path, "icd_filename": icd_path, "disease_total": len(disease_df), "icd_total": len(icd_df), "selection_mode": selection_mode, "selected_source_types": selected_sources, "selected_diagnosis_types": selected_diag, "disease_candidate_count": len(st.session_state.disease_candidates), "icd_candidate_count": len(st.session_state.icd_candidates), "final_disease_count": len(final_disease), "final_icd_count": len(final_icd), "warnings": st.session_state.warnings}
+classification_json = {"disease_name": st.session_state.disease_classified.to_dict(orient="records") if not st.session_state.disease_classified.empty else [], "icd_code": st.session_state.icd_classified.to_dict(orient="records") if not st.session_state.icd_classified.empty else []}
 zip_bytes = build_task_zip(metadata, expansion, selected_disease_df, selected_icd_df, final_disease, final_icd, mapping, classification_json, disease_df, icd_df)
 st.download_button("下载管理员任务包 ZIP", data=zip_bytes, file_name=f"{task_name or 'whale_hdr_task'}_{timestamp_string()}.zip", mime="application/zip")
-
-if st.session_state.warnings:
-    with st.expander("解析/API/流程警告", expanded=False):
-        st.write("\n".join(f"- {w}" for w in st.session_state.warnings))
